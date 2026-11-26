@@ -2,7 +2,7 @@
 
 Try the live app: [https://soc-triage-app.vercel.app](https://soc-triage-app.vercel.app)
 
-Want to test it? Ask an AI tool to generate a log file with hidden malicious activity, plus an answer key, then compare the app's results to the key.
+*** Ask an AI tool to generate a log file with hidden malicious activity, plus an answer key, then compare the app's results to the key.
 
 ## Summary
 
