@@ -1779,6 +1779,201 @@ function maxCountInWindow(sortedTimestamps: number[], windowMs: number): number 
   return maxCount;
 }
 
+const RANSOM_FILE_EXT_RE =
+  /(?:^|[\s\\/"'=:[(])[^\\/\s"'=:[\]]{0,220}\.(locked|encrypted|crypt|crypto|crypted)(?=$|[\s"'.,;)\]])/i;
+const RANSOM_NOTE_RE =
+  /\b(?:README_RESTORE|HOW_TO_DECRYPT|DECRYPT_FILES|RESTORE_FILES)\.(?:txt|html)\b/i;
+const SCRIPT_OR_BINARY_RE =
+  /\.(?:sh|bash|py|pl|rb|ps1|psm1|exe|dll|bin|so|elf|bat|cmd|vbs|js|jse|jar|msi|scr|hta|php|dylib)(?=$|[\s"'.,;)\]])/i;
+const SCANNER_PRODUCT_RE = /\b(?:nessus|tenable|qualys|openvas|greenbone|rapid7|nexpose)\b/i;
+const SCANNER_HOST_RE =
+  /\b(?=[A-Za-z0-9._-]*(?:scanner|nessus|qualys))[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)+\b/i;
+const GENERIC_PROCESS_RE =
+  /^(?:explorer|svchost|services|lsass|csrss|wininit|winlogon|dwm|conhost)\.exe$/i;
+const PLACEHOLDER_IDENTITY_RE =
+  /^(?:log buffer|pasted log buffer|host-a|user-a|unknown|n\/a|none|-|null)$/i;
+
+function lineContainsIp(line: string, ip: string): boolean {
+  const escaped = ip.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![\\d.])${escaped}(?![\\d.])`).test(line);
+}
+
+function isRansomwareDestruction(line: string): boolean {
+  if (/\bvssadmin(?:\.exe)?\b/i.test(line) && /\b(?:delete\s+shadows|resize\s+shadowstorage)\b/i.test(line)) {
+    return true;
+  }
+  if (/\bwmic(?:\.exe)?\b/i.test(line) && /\bshadowcopy\b/i.test(line) && /\bdelete\b/i.test(line)) {
+    return true;
+  }
+  if (/\bwbadmin(?:\.exe)?\b/i.test(line) && /\bdelete\s+(?:catalog|backup|systemstatebackup)\b/i.test(line)) {
+    return true;
+  }
+  if (/\bbcdedit(?:\.exe)?\b/i.test(line) && /\brecoveryenabled\b/i.test(line) && /\bno\b/i.test(line)) {
+    return true;
+  }
+  if (/\bbcdedit(?:\.exe)?\b/i.test(line) && /\bbootstatuspolicy\b/i.test(line) && /\bignoreallfailures\b/i.test(line)) {
+    return true;
+  }
+  return false;
+}
+
+function ransomFileExtension(line: string): string | null {
+  const match = line.match(RANSOM_FILE_EXT_RE);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function isHiddenDotfilePath(text: string): boolean {
+  return /(?:^|[\\/])\.[A-Za-z0-9_]/.test(text);
+}
+
+function isTempOrShmPath(text: string): boolean {
+  return /\/tmp(?:\/|$)/i.test(text) || /\/dev\/shm(?:\/|$)/i.test(text);
+}
+
+interface ScriptDownload {
+  sourceIps: string[];
+  destPaths: string[];
+  scriptLike: boolean;
+  suspiciousDrop: boolean;
+}
+
+function parseScriptDownload(line: string): ScriptDownload | null {
+  const hasCurl = /\bcurl(?:\.exe)?\b/i.test(line);
+  const hasWget = /\bwget(?:\.exe)?\b/i.test(line);
+  const hasIwr = /\b(?:Invoke-WebRequest|iwr)\b/i.test(line);
+  const hasCertutil = /\bcertutil(?:\.exe)?\b/i.test(line) && /\b-urlcache\b/i.test(line);
+  if (!hasCurl && !hasWget && !hasIwr && !hasCertutil) return null;
+  if (hasCurl && /\s(?:-T|--upload-file)\b/i.test(line) && !/\s(?:-o|-O|--output)\b/i.test(line)) {
+    return null;
+  }
+  if (hasIwr && /\b-Method\s+Post\b/i.test(line) && !/\b-OutFile\b/i.test(line)) return null;
+
+  const destPaths: string[] = [];
+  const outFlags = line.matchAll(/(?:-o|-O|--output|-OutFile|--output-document)\s+("[^"]+"|\S+)/gi);
+  for (const match of outFlags) {
+    destPaths.push(match[1].replace(/^["']|["']$/g, ''));
+  }
+  const sourceIps: string[] = [];
+  const urlPaths: string[] = [];
+  const urls = line.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+  for (const url of urls) {
+    const parts = urlHostAndPath(url);
+    if (parts.host && isUsableIp(parts.host)) sourceIps.push(parts.host);
+    if (parts.path) urlPaths.push(parts.path);
+  }
+
+  const scriptLike =
+    destPaths.some((p) => SCRIPT_OR_BINARY_RE.test(p)) ||
+    urlPaths.some((p) => SCRIPT_OR_BINARY_RE.test(p)) ||
+    SCRIPT_OR_BINARY_RE.test(line);
+  // Only the saved path counts as a drop into /tmp, /dev/shm, or a hidden dot-file.
+  const suspiciousDrop = destPaths.some((p) => isTempOrShmPath(p) || isHiddenDotfilePath(p));
+  if (!scriptLike) return null;
+  return { sourceIps, destPaths, scriptLike, suspiciousDrop };
+}
+
+function scannerIdentityForIp(ip: string, lines: IndexedLogLine[]): string | null {
+  if (!isRfc1918Ip(ip)) return null;
+  const evidence: string[] = [];
+  const push = (token: string) => {
+    const cleaned = token.trim();
+    if (!cleaned) return;
+    if (evidence.some((item) => item.toLowerCase() === cleaned.toLowerCase())) return;
+    evidence.push(cleaned);
+  };
+  for (const item of lines) {
+    if (!lineContainsIp(item.rawLine, ip)) continue;
+    const product = item.rawLine.match(SCANNER_PRODUCT_RE);
+    if (product) push(product[0]);
+    const hostRe = new RegExp(SCANNER_HOST_RE.source, 'gi');
+    for (const host of item.rawLine.match(hostRe) || []) push(host);
+  }
+  if (evidence.length === 0) return null;
+  return evidence.slice(0, 4).join(', ');
+}
+
+function authorizedScannerReason(ip: string, identity: string): string {
+  return `Authorized internal vulnerability scanner ${ip} (${identity}) produced port-scan or probe traffic with no successful exploitation, authentication success, webshell, or data exfiltration; de-escalated to Baseline – Minor (Blue)`;
+}
+
+function isPlaceholderIdentity(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  if (PLACEHOLDER_IDENTITY_RE.test(trimmed)) return true;
+  if (/^\[mock\]/i.test(trimmed)) return true;
+  return false;
+}
+
+function pushUnique(out: string[], value: string, limit: number) {
+  const cleaned = value.trim();
+  if (!cleaned || cleaned.length > 120) return;
+  if (out.some((item) => item.toLowerCase() === cleaned.toLowerCase())) return;
+  if (out.length >= limit) return;
+  out.push(cleaned);
+}
+
+function basenameToken(raw: string): string | null {
+  const cleaned = raw.replace(/^["']|["']$/g, '').trim();
+  if (!cleaned) return null;
+  const base = (cleaned.split(/[/\\]/).pop() || cleaned).split(/\s+/)[0];
+  if (!/^[A-Za-z0-9_.-]{2,80}$/.test(base)) return null;
+  if (GENERIC_PROCESS_RE.test(base)) return null;
+  if (isUsableIp(base)) return null;
+  return base;
+}
+
+function extractActivityIdentity(lines: string[]): { hosts: string[]; accounts: string[]; processes: string[] } {
+  const hosts: string[] = [];
+  const accounts: string[] = [];
+  const processes: string[] = [];
+  const accountRe =
+    /\b(?:TargetUserName|SubjectUserName|AccountName|SamAccountName|MemberName|UserName|user)["']?\s*[:=]\s*"?([A-Za-z0-9._$@\\-]{2,80})"?/gi;
+  const hostRe =
+    /\b(?:MachineName|ComputerName|Computer|hostname|host)["']?\s*[:=]\s*"?([A-Za-z][A-Za-z0-9._-]{1,80})"?/gi;
+  const processRe =
+    /\b(?:NewProcessName|ParentProcessName|Image|ParentImage|ProcessName|process)["']?\s*[:=]\s*"?([^"\s,]+)"?/gi;
+
+  for (const line of lines) {
+    const syslog = line.match(
+      /^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+([A-Za-z][A-Za-z0-9._-]{1,80})\s+\S/
+    );
+    if (syslog && !isUsableIp(syslog[1])) pushUnique(hosts, syslog[1], 8);
+
+    for (const match of line.matchAll(hostRe)) {
+      if (!/^(?:host|hostname|computer|computername|machinename)$/i.test(match[1]) && !isUsableIp(match[1])) {
+        pushUnique(hosts, match[1], 8);
+      }
+    }
+
+    for (const match of line.matchAll(accountRe)) {
+      const account = match[1].replace(/\\+$/g, '');
+      if (/^(?:-|unknown|null|none|system|local|n\/a)$/i.test(account)) continue;
+      if (/^(?:administrators|domain admins|enterprise admins|schema admins|backup operators|account operators)$/i.test(account)) {
+        continue;
+      }
+      pushUnique(accounts, account, 8);
+    }
+    const sshUser = line.match(/\bfor\s+(?:invalid\s+user\s+)?([A-Za-z0-9._-]{2,40})\s+from\b/i);
+    if (sshUser) pushUnique(accounts, sshUser[1], 8);
+    const sessionUser = line.match(/\bsession opened for user\s+([A-Za-z0-9._-]{2,40})\b/i);
+    if (sessionUser) pushUnique(accounts, sessionUser[1], 8);
+    const sudoUser = line.match(/\bsudo:\s+([A-Za-z0-9._-]{2,40})\s*:/i);
+    if (sudoUser) pushUnique(accounts, sudoUser[1], 8);
+
+    for (const match of line.matchAll(processRe)) {
+      const base = basenameToken(match[1]);
+      if (base) pushUnique(processes, base, 8);
+    }
+    const command = line.match(/\bCOMMAND=\s*(\S+)/i);
+    if (command) {
+      const base = basenameToken(command[1]);
+      if (base && !/^(?:sudo|env|nice|nohup|time)$/i.test(base)) pushUnique(processes, base, 8);
+    }
+  }
+
+  return { hosts, accounts, processes };
+}
+
 interface ParsedTelemetryInternal {
   summary: DeterministicTelemetrySummary;
   detectedFormats: string[];
@@ -1792,8 +1987,10 @@ interface ParsedTelemetryInternal {
     high: Set<number>;
     medium: Set<number>;
     low: Set<number>;
+    baselineMinor: Set<number>;
   };
   lowFloorReasons: string[];
+  baselineMinorReasons: string[];
   perLineBenignReason: Map<number, string>;
 }
 
@@ -1806,6 +2003,7 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
   const ipSucceededAfterFailure = new Set<string>();
   const ipFailedLineNums = new Map<string, number[]>();
   const ipSuccessLineNums = new Map<string, number[]>();
+  const ipAuthSuccess = new Set<string>();
 
   // Port scan tracking per srcIp
   interface PortProbeEvent {
@@ -1877,6 +2075,11 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
   const highLines = new Set<number>();
   const mediumLines = new Set<number>();
   const lowLines = new Set<number>();
+  const baselineMinorLines = new Set<number>();
+  const baselineMinorReasons: string[] = [];
+  const ransomExtLines: Array<{ lineNumber: number; ext: string }> = [];
+  let ransomwareDestructionCount = 0;
+  let ransomwareNoteCount = 0;
   let externalFailedLoginCount = 0;
   const externalFailedLoginIps = new Set<string>();
 
@@ -2374,6 +2577,7 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
         userPasswordChangeLines.set(u, arr);
       }
       if (srcIp) {
+        ipAuthSuccess.add(srcIp);
         const lastFailIdx = ipLastFailedIndex.get(srcIp);
         if (lastFailIdx !== undefined && idx > lastFailIdx) {
           ipSucceededAfterFailure.add(srcIp);
@@ -2494,6 +2698,21 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
       highLines.add(ln);
     }
 
+    // Ransomware: shadow/backup destruction and ransom notes are Critical on their own.
+    // Mass encrypted-extension creates are promoted after the full log is counted.
+    if (isRansomwareDestruction(line)) {
+      ransomwareDestructionCount++;
+      addTag(ln, 'Ransomware shadow-copy, backup, or recovery destruction');
+      criticalLines.add(ln);
+    }
+    if (RANSOM_NOTE_RE.test(line)) {
+      ransomwareNoteCount++;
+      addTag(ln, 'Ransomware note (restore or decrypt instructions)');
+      criticalLines.add(ln);
+    }
+    const ransomExt = ransomFileExtension(line);
+    if (ransomExt) ransomExtLines.push({ lineNumber: ln, ext: ransomExt });
+
     // Suspicious Web / DNS / Network patterns (URL-decode up to twice)
     const webHaystack = decodeRequestForWebRules(line);
     const sqliHaystack = normalizeForSqli(line);
@@ -2575,6 +2794,29 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
       );
     }
   }
+
+  // Post-pass: ransomware file creates. One shadow-delete or note is enough; otherwise
+  // require a mass of the same ransom extension so a single renamed file stays quiet.
+  const ransomExtCounts = new Map<string, number>();
+  for (const item of ransomExtLines) {
+    ransomExtCounts.set(item.ext, (ransomExtCounts.get(item.ext) || 0) + 1);
+  }
+  const massRansomExts = new Set(
+    [...ransomExtCounts.entries()].filter(([, count]) => count >= 5).map(([ext]) => ext)
+  );
+  let ransomwareFileCount = 0;
+  const promoteRansomFiles = ransomwareDestructionCount > 0 || ransomwareNoteCount > 0 || massRansomExts.size > 0;
+  if (promoteRansomFiles) {
+    for (const item of ransomExtLines) {
+      if (ransomwareDestructionCount === 0 && ransomwareNoteCount === 0 && !massRansomExts.has(item.ext)) {
+        continue;
+      }
+      ransomwareFileCount++;
+      addTag(item.lineNumber, `Ransomware encrypted-file create (.${item.ext})`);
+      criticalLines.add(item.lineNumber);
+    }
+  }
+  const ransomwareCount = ransomwareDestructionCount + ransomwareNoteCount + ransomwareFileCount;
 
   // Post-pass 1: correlate 4720 + 4732 (new account + security group add) -> Critical
   if (event4720 > 0 && (event4732 > 0 || event4728 > 0 || event4756 > 0)) {
@@ -2693,9 +2935,73 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
     }
   }
 
+  // Post-pass: script/binary downloads that continue an intrusion, or that land in
+  // a temp/hidden path. Upload-only curl/IWR stays on the exfil rule above.
+  const attackerIps = new Set<string>();
+  for (const detail of bruteForceIps) {
+    if (detail.failedCount >= 8) attackerIps.add(detail.ip);
+  }
+  for (const [ip, fails] of ipFailedCounts.entries()) {
+    if (fails >= 8 && ipSucceededAfterFailure.has(ip)) attackerIps.add(ip);
+  }
+  let followOnDownloadCount = 0;
+  const downloadedPaths = new Set<string>();
+  for (const item of indexedLines) {
+    const download = parseScriptDownload(item.rawLine);
+    if (!download) continue;
+    const fromAttacker = download.sourceIps.filter((ip) => attackerIps.has(ip));
+    if (fromAttacker.length === 0 && !download.suspiciousDrop) continue;
+    for (const dest of download.destPaths) downloadedPaths.add(dest);
+    followOnDownloadCount++;
+    const why =
+      fromAttacker.length > 0
+        ? `Malicious follow-on script/binary download from attacker IP ${fromAttacker.join(', ')}`
+        : `Suspicious script/binary download into a temp path or hidden dot-file (${download.destPaths.slice(0, 2).join(', ') || 'see command'})`;
+    addTag(item.lineNumber, why);
+    highLines.add(item.lineNumber);
+  }
+  for (const item of indexedLines) {
+    if (highLines.has(item.lineNumber) || criticalLines.has(item.lineNumber)) continue;
+    if (/\b(?:curl|wget|Invoke-WebRequest|iwr|certutil)(?:\.exe)?\b/i.test(item.rawLine)) continue;
+    const command = item.rawLine.match(/\bCOMMAND=\s*(.+)$/i)?.[1] || item.rawLine;
+    const scriptExec =
+      SCRIPT_OR_BINARY_RE.test(command) &&
+      (isTempOrShmPath(command) || isHiddenDotfilePath(command));
+    if (!scriptExec) continue;
+    const runsDownloaded = [...downloadedPaths].some((dest) => dest && command.includes(dest));
+    if (!runsDownloaded && attackerIps.size === 0) continue;
+    followOnDownloadCount++;
+    addTag(
+      item.lineNumber,
+      'Malicious follow-on execution of a script or binary from a temp path or hidden dot-file'
+    );
+    highLines.add(item.lineNumber);
+  }
+
+  const ipHasRealCompromise = (ip: string): boolean => {
+    if (ipAuthSuccess.has(ip)) return true;
+    for (const item of indexedLines) {
+      if (!lineContainsIp(item.rawLine, ip)) continue;
+      const ln = item.lineNumber;
+      if (criticalLines.has(ln) || highLines.has(ln)) return true;
+      if (!mediumLines.has(ln)) continue;
+      const tags = lineTags.get(ln) || [];
+      const onlyProbe = tags.every((tag) => /port scan|host\/port sweep|probe/i.test(tag));
+      if (!onlyProbe) return true;
+    }
+    return false;
+  };
+
+  const rememberScanner = (ip: string, identity: string) => {
+    const reason = authorizedScannerReason(ip, identity);
+    if (!baselineMinorReasons.includes(reason)) baselineMinorReasons.push(reason);
+    return reason;
+  };
+
   // Post-pass 3: (C) Port scan detection across firewall CSV & network logs
   // (>=15 distinct dst ports OR >=3 dst hosts with DENY/SYN within 10 minutes)
   let detectedPortScanIps = 0;
+  const deescalatedScannerIps = new Set<string>();
   for (const [ip, events] of ipProbeEvents.entries()) {
     if (authorizedScannerIps.has(ip)) continue;
     const withTs = events.filter((e) => e.tsMs !== null).sort((a, b) => (a.tsMs ?? 0) - (b.tsMs ?? 0));
@@ -2755,15 +3061,71 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
     }
 
     if (scanTriggered) {
-      detectedPortScanIps++;
-      events.forEach((e) => {
-        if (e.isBlockedOrSyn || events.length <= 200) {
-          addTag(e.lineNumber, triggerDesc);
-          mediumLines.add(e.lineNumber);
-        }
-      });
+      const identity = scannerIdentityForIp(ip, indexedLines);
+      const deescalate = Boolean(identity) && isRfc1918Ip(ip) && !ipHasRealCompromise(ip);
+      if (deescalate && identity) {
+        deescalatedScannerIps.add(ip);
+        const reason = rememberScanner(ip, identity);
+        events.forEach((e) => {
+          if (e.isBlockedOrSyn || events.length <= 200) {
+            addTag(e.lineNumber, reason);
+            baselineMinorLines.add(e.lineNumber);
+          }
+        });
+      } else {
+        detectedPortScanIps++;
+        events.forEach((e) => {
+          if (e.isBlockedOrSyn || events.length <= 200) {
+            addTag(e.lineNumber, triggerDesc);
+            mediumLines.add(e.lineNumber);
+          }
+        });
+      }
     }
   }
+
+  // Keyword port-scan lines (nmap, "port scan") from the same internal scanner.
+  if (explicitPortScanLines > 0) {
+    for (const item of indexedLines) {
+      const tags = lineTags.get(item.lineNumber) || [];
+      if (!tags.includes('Port Scan Indicator')) continue;
+      const src = extractNetworkTuple(item.rawLine, null).srcIp;
+      if (!src || !isRfc1918Ip(src) || ipHasRealCompromise(src)) continue;
+      const identity = scannerIdentityForIp(src, indexedLines);
+      if (!identity) continue;
+      const otherMedium = tags.some((tag) =>
+        /Path Traversal|Credential-harvest|Failed Login Burst|Password Spray|Login After Burst|Phishing/i.test(tag)
+      );
+      if (!otherMedium) {
+        mediumLines.delete(item.lineNumber);
+        explicitPortScanLines--;
+      }
+      deescalatedScannerIps.add(src);
+      addTag(item.lineNumber, rememberScanner(src, identity));
+      baselineMinorLines.add(item.lineNumber);
+    }
+  }
+
+  for (const item of indexedLines) {
+    if (
+      criticalLines.has(item.lineNumber) ||
+      highLines.has(item.lineNumber) ||
+      mediumLines.has(item.lineNumber) ||
+      lowLines.has(item.lineNumber) ||
+      baselineMinorLines.has(item.lineNumber)
+    ) {
+      continue;
+    }
+    for (const ip of deescalatedScannerIps) {
+      if (!lineContainsIp(item.rawLine, ip) || !SCANNER_PRODUCT_RE.test(item.rawLine)) continue;
+      const identity = scannerIdentityForIp(ip, indexedLines);
+      if (!identity) continue;
+      addTag(item.lineNumber, rememberScanner(ip, identity));
+      baselineMinorLines.add(item.lineNumber);
+      break;
+    }
+  }
+
   const portScanCount = explicitPortScanLines + detectedPortScanIps;
 
   // Post-pass 4: (D) C2 Beaconing detection (>=20 connections with low interval variance)
@@ -2845,6 +3207,15 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
   if ([...criticalLines].some((n) => (lineTags.get(n) || []).some((t) => /pkexec/i.test(t)))) {
     criticalReasons.push('Local root exploit via pkexec (PwnKit pattern)');
   }
+  if (ransomwareCount > 0) {
+    const signals: string[] = [];
+    if (ransomwareDestructionCount > 0) {
+      signals.push('shadow-copy, backup, or recovery destruction (vssadmin, wmic, wbadmin, or bcdedit)');
+    }
+    if (ransomwareNoteCount > 0) signals.push('ransom note');
+    if (ransomwareFileCount > 0) signals.push('mass ransom-extension file creates');
+    criticalReasons.push(`Ransomware activity detected (${ransomwareCount} events: ${signals.join('; ')})`);
+  }
 
   const highReasons: string[] = [];
   const bruteSuccessIps = bruteForceIps.filter((b) => b.failedCount >= 14 && b.followedBySuccess);
@@ -2887,6 +3258,11 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
   }
   if (lolbinCount > 0) {
     highReasons.push(`Suspicious encoded command or living-off-the-land download detected (${lolbinCount} events)`);
+  }
+  if (followOnDownloadCount > 0) {
+    highReasons.push(
+      `Post-compromise script/binary download or follow-on execution detected (${followOnDownloadCount} events)`
+    );
   }
   if (phishingHighCount > 0) {
     highReasons.push(`Credential-harvest POST to an external login page detected (${phishingHighCount} events)`);
@@ -2938,6 +3314,10 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
     floorTier = 'Low';
     floorLevelCode = 'LOW_GREEN';
     floorReasons = lowReasons;
+  } else if (baselineMinorReasons.length > 0) {
+    floorTier = 'Baseline';
+    floorLevelCode = 'BASELINE_MINOR_BLUE';
+    floorReasons = baselineMinorReasons;
   }
 
   const suspiciousLines = indexedLines.filter((l) => suspiciousLineSet.has(l.lineNumber));
@@ -2989,8 +3369,10 @@ function computeDeterministicTelemetry(indexedLines: IndexedLogLine[]): ParsedTe
       high: highLines,
       medium: mediumLines,
       low: lowLines,
+      baselineMinor: baselineMinorLines,
     },
     lowFloorReasons: lowReasons,
+    baselineMinorReasons,
     perLineBenignReason,
   };
 }
@@ -3241,6 +3623,20 @@ function getFloorForLines(
           : telemetry.summary.computedSeverityFloor.reasons,
     };
   }
+  let hasBaselineMinor = false;
+  for (const ln of lineNumbers) {
+    if (telemetry.floorLineNumbers.baselineMinor.has(ln)) hasBaselineMinor = true;
+  }
+  if (hasBaselineMinor) {
+    return {
+      floorTier: 'Baseline',
+      floorLevelCode: 'BASELINE_MINOR_BLUE',
+      reasons:
+        telemetry.baselineMinorReasons.length > 0
+          ? telemetry.baselineMinorReasons
+          : telemetry.summary.computedSeverityFloor.reasons,
+    };
+  }
 
   if (applyGlobalFallback) {
     return telemetry.summary.computedSeverityFloor;
@@ -3352,7 +3748,12 @@ function buildFallbackFloorCluster(
     },
     contextSummary,
     shortRead: {
-      classification: floor.floorTier === 'Critical' ? 'Confirmed Incident' : 'Major Incident Not Yet Ruled Out',
+      classification:
+        floor.floorLevelCode === 'BASELINE_MINOR_BLUE'
+          ? 'Observable Event'
+          : floor.floorTier === 'Critical'
+            ? 'Confirmed Incident'
+            : 'Major Incident Not Yet Ruled Out',
       playbookPhase: 'Detection & Analysis -> Containment, Eradication & Recovery',
       playbookCitation: 'CISA IR Playbook pp. 8–15',
       summary: `Deterministic log parsing flagged ${unassignedLines.length} security-relevant events triggering a minimum ${floor.floorTier} severity floor: ${floor.reasons.join('; ')}.`,
@@ -3484,12 +3885,37 @@ function enforcePlaybookRules(
       severity.levelCode = clusterFloor.floorLevelCode;
     }
 
-    severity.severityFloorApplied = {
-      floorTier: clusterFloor.floorTier,
-      floorLevelCode: clusterFloor.floorLevelCode,
-      enforced: clusterFloor.floorTier !== 'Informational/Low',
-      reasons: clusterFloor.reasons,
-    };
+    // Authorized internal scanners are a downward override of the port-scan Medium
+    // floor. Never apply it when the same cluster still has a real compromise floor.
+    const lineFloor = getFloorForLines(clusterLineNums, telemetry, false);
+    const clusterHasHigherFloor = clusterLineNums.some(
+      (n) =>
+        telemetry.floorLineNumbers.critical.has(n) ||
+        telemetry.floorLineNumbers.high.has(n) ||
+        telemetry.floorLineNumbers.medium.has(n) ||
+        telemetry.floorLineNumbers.low.has(n)
+    );
+    const scannerDeescalated =
+      !clusterHasHigherFloor &&
+      lineFloor.floorLevelCode === 'BASELINE_MINOR_BLUE' &&
+      clusterLineNums.some((n) => telemetry.floorLineNumbers.baselineMinor.has(n));
+    if (scannerDeescalated) {
+      severity.levelCode = 'BASELINE_MINOR_BLUE';
+    }
+
+    severity.severityFloorApplied = scannerDeescalated
+      ? {
+          floorTier: 'Baseline',
+          floorLevelCode: 'BASELINE_MINOR_BLUE',
+          enforced: true,
+          reasons: lineFloor.reasons,
+        }
+      : {
+          floorTier: clusterFloor.floorTier,
+          floorLevelCode: clusterFloor.floorLevelCode,
+          enforced: clusterFloor.floorTier !== 'Informational/Low',
+          reasons: clusterFloor.reasons,
+        };
 
     const canonicalNciss =
       NCISS_DEFINITIONS[severity.levelCode] || NCISS_DEFINITIONS.UNSCORABLE_GRAY;
@@ -3498,10 +3924,17 @@ function enforcePlaybookRules(
     severity.ncissDefinitionQuote = canonicalNciss.definition;
     severity.ncissCitation = canonicalNciss.citation;
 
-    if (floorWasRaised) {
+    if (floorWasRaised && !scannerDeescalated) {
       const prevDef = NCISS_DEFINITIONS[geminiInitial];
       const suffix = ` [Deterministic code floor (${clusterFloor.floorTier} / ${canonicalNciss.ncissLevelName}) raised severity from ${prevDef ? prevDef.ncissLevelName : geminiInitial}: ${clusterFloor.reasons.join('; ')}.]`;
       severity.ncissJustification = `${severity.ncissJustification || ''}${suffix}`.trim();
+    }
+    if (scannerDeescalated) {
+      const why = lineFloor.reasons.join('; ');
+      if (why && !(severity.ncissJustification || '').includes('de-escalated to Baseline')) {
+        severity.ncissJustification = `${severity.ncissJustification || ''} ${why}.`.trim();
+      }
+      if (card.shortRead) card.shortRead.classification = 'Observable Event';
     }
 
     if (severity.levelCode !== 'UNSCORABLE_GRAY') {
@@ -3611,6 +4044,52 @@ function enforcePlaybookRules(
         card.notificationAssessment?.reportingCitation ||
         'CISA Federal Incident Notification Guidelines, Notification Requirement & Submitting Incident Notifications, pp. 2–6; CISA Playbook pp. 10, 18, 34',
     };
+
+    const identity = extractActivityIdentity((card.clusterLogs || []).map((entry) => entry.excerpt || ''));
+    if (card.shortRead) {
+      const hosts = (card.shortRead.affectedHosts || []).filter((value) => !isPlaceholderIdentity(value));
+      const accounts = (card.shortRead.affectedAccounts || []).filter((value) => !isPlaceholderIdentity(value));
+      card.shortRead.affectedHosts = hosts.length > 0 ? hosts : identity.hosts;
+      card.shortRead.affectedAccounts = accounts.length > 0 ? accounts : identity.accounts;
+      if (card.shortRead.affectedHosts.length === 0) {
+        const scannerHosts: string[] = [];
+        const hostRe = new RegExp(SCANNER_HOST_RE.source, 'gi');
+        for (const excerpt of (card.clusterLogs || []).map((entry) => entry.excerpt || '')) {
+          for (const token of excerpt.match(hostRe) || []) {
+            if (!isUsableIp(token)) pushUnique(scannerHosts, token, 4);
+          }
+        }
+        if (scannerHosts.length > 0) card.shortRead.affectedHosts = scannerHosts;
+      }
+      if (identity.processes.length > 0) {
+        const fact = `Affected process(es): ${identity.processes.join(', ')}`;
+        const facts = card.shortRead.knownFacts || [];
+        if (!facts.some((item) => item.includes('Affected process'))) {
+          card.shortRead.knownFacts = [...facts, fact];
+        }
+        if (card.shortRead.summary && !identity.processes.some((proc) => card.shortRead.summary.includes(proc))) {
+          card.shortRead.summary = `${card.shortRead.summary} Affected process(es): ${identity.processes.join(', ')}.`;
+        }
+      }
+    }
+    if (card.clusteringBasis) {
+      const basisHosts = (card.clusteringBasis.hosts || []).filter((value) => !isPlaceholderIdentity(value));
+      const basisUsers = (card.clusteringBasis.users || []).filter((value) => !isPlaceholderIdentity(value));
+      card.clusteringBasis.hosts = basisHosts.length > 0 ? basisHosts : card.shortRead?.affectedHosts || identity.hosts;
+      card.clusteringBasis.users = basisUsers.length > 0 ? basisUsers : identity.accounts;
+      const basisIps = (card.clusteringBasis.ips || []).filter(
+        (value) => !isPlaceholderIdentity(value) && isUsableIp(value)
+      );
+      if (basisIps.length === 0) {
+        const foundIps: string[] = [];
+        for (const excerpt of (card.clusterLogs || []).map((entry) => entry.excerpt || '')) {
+          for (const ip of extractAllIpv4(excerpt)) pushUnique(foundIps, ip, 8);
+        }
+        card.clusteringBasis.ips = foundIps;
+      } else {
+        card.clusteringBasis.ips = basisIps;
+      }
+    }
 
     return {
       ...card,
@@ -3779,7 +4258,7 @@ STRICT RULES TO FOLLOW:
      * BASELINE_MINOR_BLUE -> Baseline – Minor (Blue) [NCISS pp. 5–6]
      * BASELINE_NEGLIGIBLE_WHITE -> Baseline – Negligible (White) [NCISS pp. 5–6]
      * UNSCORABLE_GRAY -> Unscorable (Gray): use ONLY if the cluster truly cannot be scored under NCISS, and explain why in unscorableReason.
-   - Server enforces minimum code severity floors: Critical (SEVERE_RED) for audit log clear (1102), new admin/security group account add (4720+4732), or service install (7045); High (HIGH_ORANGE) for brute force (>=20 failed logins from one IP followed by success), SQLi, XSS, webshell, C2 beaconing, large outbound exfiltration, DNS tunneling, privilege escalation, lateral movement, persistence, cloud IAM abuse, encoded living-off-the-land commands, or a credential-harvest POST to an external login page; Medium (MEDIUM_YELLOW) for failed-login burst/spray without success, port scans, path traversal, or phishing clicks to an external login page; Low (LOW_GREEN) for any failed login from a non-RFC1918 external source IP; clean internal baseline logs stay Baseline.
+   - Server enforces minimum code severity floors: Critical (SEVERE_RED) for audit log clear (1102), new admin/security group account add (4720+4732), service install (7045), or ransomware (vssadmin delete shadows / resize shadowstorage, wmic shadowcopy delete, wbadmin delete catalog/backup, bcdedit recoveryenabled no or bootstatuspolicy ignoreallfailures, ransom notes, or mass ransom-extension file creates); High (HIGH_ORANGE) for brute force (>=20 failed logins from one IP followed by success), SQLi, XSS, webshell, C2 beaconing, large outbound exfiltration, DNS tunneling, privilege escalation, lateral movement, persistence, cloud IAM abuse, encoded living-off-the-land commands, a credential-harvest POST to an external login page, or a script/binary download (curl, wget, Invoke-WebRequest, certutil -urlcache) from an IP with brute-force or successful-attacker-login history or into /tmp, /dev/shm, or a hidden dot-file; Medium (MEDIUM_YELLOW) for failed-login burst/spray without success, port scans, path traversal, or phishing clicks to an external login page; an internal RFC1918 vulnerability scanner (User-Agent or label Nessus, Tenable, Qualys, OpenVAS, Greenbone, Rapid7/Nexpose, or a hostname containing scanner/nessus/qualys) whose activity is only port scans or probes, with no successful exploitation, authentication success, webshell, or exfiltration, is de-escalated to Baseline – Minor (Blue) and that de-escalation must never lower a cluster that has real compromise indicators and must never apply to external IPs; Low (LOW_GREEN) for any failed login from a non-RFC1918 external source IP; clean internal baseline logs stay Baseline.
    - Missing mission context must NEVER raise a clean or Baseline log above Baseline by itself.
 3. SCOPE & CROSSOVER GATES (Playbook pp. 4, 21–24, 26):
    - NSS / Classified (44 U.S.C. 3552(b)(6)): set nssOutOfScope=true and direct to CNSSI 1010 (Playbook p. 4, p. 26).
@@ -4262,7 +4741,8 @@ STRICT RULES TO FOLLOW:
       (telemetry.floorLineNumbers.critical.has(item.lineNumber) ||
         telemetry.floorLineNumbers.high.has(item.lineNumber) ||
         telemetry.floorLineNumbers.medium.has(item.lineNumber) ||
-        telemetry.floorLineNumbers.low.has(item.lineNumber))
+        telemetry.floorLineNumbers.low.has(item.lineNumber) ||
+        telemetry.floorLineNumbers.baselineMinor.has(item.lineNumber))
   );
 
   if (unassignedFloorLines.length > 0) {
@@ -4425,7 +4905,7 @@ export async function createApp(options?: { serveStatic?: boolean }): Promise<ex
         nssOrClassifiedDetected: telemetry.nssDetected,
         nssEvidence: telemetry.nssEvidence,
         needsAnalystContextPrompt: needsPrompt,
-        inspectionSummary: `Parsed all ${indexedLines.length.toLocaleString()} log lines deterministically (${s.uniqueSourceIps.toLocaleString()} unique source IPs, ${s.failedLogins.toLocaleString()} failed logins, ${s.blockedDeniedConnections.toLocaleString()} blocked/denied events, ${s.http4xxCount.toLocaleString()} HTTP 4xx, ${s.http5xxCount.toLocaleString()} HTTP 5xx; code-computed minimum floor: ${s.computedSeverityFloor.floorTier}).`,
+        inspectionSummary: `Parsed all ${indexedLines.length.toLocaleString()} log lines deterministically (${s.uniqueSourceIps.toLocaleString()} unique source IPs, ${s.failedLogins.toLocaleString()} failed logins, ${s.blockedDeniedConnections.toLocaleString()} blocked/denied events, ${s.http4xxCount.toLocaleString()} HTTP 4xx, ${s.http5xxCount.toLocaleString()} HTTP 5xx; code-computed minimum floor: ${s.computedSeverityFloor.floorTier} / ${s.computedSeverityFloor.floorLevelCode}).`,
       };
 
       res.json(inspectionResult);
@@ -4615,7 +5095,7 @@ export async function createApp(options?: { serveStatic?: boolean }): Promise<ex
         nssOrClassifiedDetected: telemetry.nssDetected,
         nssEvidence: telemetry.nssEvidence,
         needsAnalystContextPrompt: needsPrompt,
-        inspectionSummary: `Parsed all ${indexedLines.length.toLocaleString()} log lines deterministically (${s.uniqueSourceIps.toLocaleString()} unique source IPs, ${s.failedLogins.toLocaleString()} failed logins, ${s.blockedDeniedConnections.toLocaleString()} blocked/denied events, ${s.http4xxCount.toLocaleString()} HTTP 4xx, ${s.http5xxCount.toLocaleString()} HTTP 5xx; code-computed minimum floor: ${s.computedSeverityFloor.floorTier}).`,
+        inspectionSummary: `Parsed all ${indexedLines.length.toLocaleString()} log lines deterministically (${s.uniqueSourceIps.toLocaleString()} unique source IPs, ${s.failedLogins.toLocaleString()} failed logins, ${s.blockedDeniedConnections.toLocaleString()} blocked/denied events, ${s.http4xxCount.toLocaleString()} HTTP 4xx, ${s.http5xxCount.toLocaleString()} HTTP 5xx; code-computed minimum floor: ${s.computedSeverityFloor.floorTier} / ${s.computedSeverityFloor.floorLevelCode}).`,
       };
       const jobId = crypto.randomUUID();
       const now = Date.now();
