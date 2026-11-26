@@ -4,8 +4,12 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/[...path].ts": {
-      "maxDuration": 300
-    }
+    "api/health.ts": { "maxDuration": 300 },
+    "api/triage/inspect.ts": { "maxDuration": 300 },
+    "api/triage/analyze.ts": { "maxDuration": 300 },
+    "api/triage/jobs/inspect.ts": { "maxDuration": 300 },
+    "api/triage/jobs/analyze.ts": { "maxDuration": 300 },
+    "api/triage/jobs/[jobId].ts": { "maxDuration": 300 },
+    "api/[[...path]].ts": { "maxDuration": 300 }
   }
 }

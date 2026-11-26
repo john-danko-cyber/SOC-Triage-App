@@ -375,7 +375,10 @@ const BACKOFF_SCHEDULE_MS = [1000, 2000, 4000];
 const LLM_ATTEMPT_TIMEOUT_MS = Number(process.env.LLM_ATTEMPT_TIMEOUT_MS) || 45_000;
 // Maximum size of the pre-summarized log digest sent in the analysis API call text part.
 // Counts, floors, and rule matches are still computed on every line of the full log.
-const LLM_LOG_PAYLOAD_MAX_CHARS = 32_000;
+// Groq's free on_demand tier caps openai/gpt-oss-120b at 8000 tokens per minute, and a
+// single request larger than that returns 413. 12,000 characters keeps dense log digests
+// under that ceiling; raise only if the key is on a higher tier.
+const LLM_LOG_PAYLOAD_MAX_CHARS = Number(process.env.LLM_LOG_PAYLOAD_MAX_CHARS) || 12_000;
 // Per-line cap applied in parseIndexedLogLines so one huge line cannot crash rule matching.
 const MAX_LOG_LINE_CHARS = 64_000;
 
@@ -440,6 +443,12 @@ async function generateWithRetry<T>(
       const baseDelay = BACKOFF_SCHEDULE_MS[attempt - 1] ?? 4000;
       const jitterMs = Math.floor(Math.random() * 750);
       let delayMs = baseDelay + jitterMs;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const retryIn = errMsg.match(/try again in\s+([0-9]*\.?[0-9]+)\s*s/i);
+      if (retryIn) {
+        const hinted = Math.ceil(parseFloat(retryIn[1]) * 1000) + 250;
+        delayMs = Math.max(delayMs, Math.min(hinted, 30_000));
+      }
       if (isMockLlm()) {
         const scale = Number(process.env.MOCK_BACKOFF_SCALE ?? '0.1');
         delayMs = Math.round(delayMs * (Number.isFinite(scale) && scale >= 0 ? scale : 0.1));

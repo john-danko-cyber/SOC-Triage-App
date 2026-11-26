@@ -75,13 +75,13 @@ export async function completeTriageJson(options: {
       { role: 'system', content: options.systemInstruction },
       { role: 'user', content: options.userPrompt },
     ],
+    // json_object keeps the huge triage schema out of the request body. Free Groq
+    // tiers cap a single request (and TPM) at 8000 tokens for this model; sending
+    // the schema plus a large log digest overflows that ceiling (HTTP 413).
+    // The user prompt already describes the schema, and the server still validates
+    // the parsed JSON against the same TypeScript checks as before.
     response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: 'triage_analysis',
-        strict: false,
-        schema: options.responseSchema,
-      },
+      type: 'json_object',
     },
   };
 
