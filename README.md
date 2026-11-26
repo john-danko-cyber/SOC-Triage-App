@@ -2,6 +2,8 @@
 
 Try the live app: [https://soc-triage-app.vercel.app](https://soc-triage-app.vercel.app)
 
+Want to test it? Ask an AI tool to generate a log file with hidden malicious activity, plus an answer key, then compare the app's results to the key.
+
 ## Summary
 
 This web app helps a SOC analyst triage security logs. You paste in raw logs, such as Windows login events, firewall logs, DNS logs, or web logs. The app counts the evidence, groups related events, and rates the incident using CISA's National Cyber Incident Scoring System (NCISS). That is the same scoring system federal agencies use. It also lists recommended next steps from CISA's federal incident response playbooks.
