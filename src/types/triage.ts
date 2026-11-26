@@ -62,7 +62,13 @@ export type SeverityLevelCode =
   | 'BASELINE_NEGLIGIBLE_WHITE'
   | 'UNSCORABLE_GRAY';
 
-export type SeverityFloorTier = 'Critical' | 'High' | 'Medium' | 'Informational/Low';
+export type SeverityFloorTier =
+  | 'Critical'
+  | 'High'
+  | 'Medium'
+  | 'Low'
+  | 'Baseline'
+  | 'Informational/Low';
 
 export interface SeverityFloorInfo {
   floorTier: SeverityFloorTier;
